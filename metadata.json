@@ -1,0 +1,8 @@
+{
+  "name": "Remix Federated AI Rewards Covenant",
+  "description": "Decentralized federated learning governance, Shapley contribution valuation, Byzantine-resilient consensus, and algorithmic reward covenants.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
