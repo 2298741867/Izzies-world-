@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Covenant, FederatedNode, TrainingRound, ByzantineAttackConfig } from './types/covenant';
+import { Covenant, FederatedNode, TrainingRound, ByzantineAttackConfig, DisputeRuling } from './types/covenant';
 import { INITIAL_COVENANTS, INITIAL_NODES, INITIAL_ROUNDS_HISTORY } from './utils/mockFederatedData';
 import { filterByzantineGradients, computeMonteCarloShapley } from './utils/shapley';
 import { TopNavigation } from './components/TopNavigation';
@@ -31,11 +31,20 @@ export default function App() {
 
   const activeCovenant = covenants.find((c) => c.id === activeCovenantId) || covenants[0];
   const autoLoopTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const roundBusyRef = useRef(false);
+  const nodesRef = useRef(nodes);
+  const covenantsRef = useRef(covenants);
+  const attackConfigRef = useRef(attackConfig);
+  nodesRef.current = nodes;
+  covenantsRef.current = covenants;
+  attackConfigRef.current = attackConfig;
 
   // Execute a Single Federated Learning Round
   const executeRoundStep = () => {
-    if (isSimulating) return;
+    if (roundBusyRef.current) return;
+    roundBusyRef.current = true;
     setIsSimulating(true);
+    const roundCovenantId = activeCovenant.id;
 
     // Phase 1: Broadcast
     setSimulationPhase(1);
@@ -49,9 +58,11 @@ export default function App() {
         setSimulationPhase(3);
 
         // Update node telemetry according to attack config
-        const updatedNodes = nodes.map((node) => {
-          if (node.id === 'node-adversary-06') {
-            if (attackConfig.type === 'label-flip') {
+        const currentAttack = attackConfigRef.current;
+        const updatedNodes = nodesRef.current.map((node) => {
+          if (node.status === 'Slashed') return node;
+          if (node.id === currentAttack.targetNodeId) {
+            if (currentAttack.type === 'label-flip') {
               return {
                 ...node,
                 isAdversary: true,
@@ -60,7 +71,7 @@ export default function App() {
                 gradientNorm: 8.2,
                 marginalLossReduction: -0.05,
               };
-            } else if (attackConfig.type === 'free-rider') {
+            } else if (currentAttack.type === 'free-rider') {
               return {
                 ...node,
                 isAdversary: true,
@@ -69,7 +80,7 @@ export default function App() {
                 gradientNorm: 0.02,
                 marginalLossReduction: 0.0,
               };
-            } else if (attackConfig.type === 'gradient-explosion') {
+            } else if (currentAttack.type === 'gradient-explosion') {
               return {
                 ...node,
                 isAdversary: true,
@@ -98,32 +109,61 @@ export default function App() {
           };
         });
 
-        const defenseResult = filterByzantineGradients(updatedNodes, activeCovenant.aggregationAlgorithm);
-
         setTimeout(() => {
           // Phase 4: Shapley Settlement
           setSimulationPhase(4);
 
-          // Calculate Shapley values for accepted nodes
-          const shapleyScores = computeMonteCarloShapley(updatedNodes, 100);
+          const roundCovenant = covenantsRef.current.find((c) => c.id === roundCovenantId)!;
+          const telemetryById = new Map(updatedNodes.map((node) => [node.id, node]));
+          const mergeTelemetry = (currentNodes: FederatedNode[]) => currentNodes.map((node) => {
+            const telemetry = telemetryById.get(node.id);
+            if (!telemetry || node.status === 'Slashed') return node;
+            return {
+              ...node,
+              isAdversary: telemetry.isAdversary,
+              adversaryType: telemetry.adversaryType,
+              cosineSimilarity: telemetry.cosineSimilarity,
+              gradientNorm: telemetry.gradientNorm,
+              marginalLossReduction: telemetry.marginalLossReduction,
+            };
+          });
+          const settlementNodes = mergeTelemetry(nodesRef.current);
+          const defenseResult = filterByzantineGradients(
+            settlementNodes.filter((node) => node.status !== 'Slashed'),
+            roundCovenant.aggregationAlgorithm
+          );
+          const slashedIds = new Set(defenseResult.slashedNodes.map((node) => node.id));
+          const flaggedIds = new Set(defenseResult.flaggedNodes.map((node) => node.id));
+          const shapleyScores = computeMonteCarloShapley(
+            settlementNodes.filter((node) => node.status !== 'Slashed' && !slashedIds.has(node.id)),
+            100
+          );
 
-          let totalSlashedCOV = 0;
-          const finalNodes = updatedNodes.map((node) => {
-            const isSlashed = defenseResult.slashedNodes.some((sn) => sn.id === node.id);
-            const isFlagged = defenseResult.flaggedNodes.some((fn) => fn.id === node.id);
+          const stateHashes = new Map(settlementNodes.map((node) => [
+            node.id,
+            '0x' + Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join(''),
+          ]));
+          const settleNode = (node: FederatedNode) => {
+            const isSlashed = slashedIds.has(node.id);
+            const isFlagged = flaggedIds.has(node.id) || node.status === 'Flagged';
 
             let status = node.status;
             let currentStake = node.stakeAmount;
             let currentSlashed = node.slashedLosses;
             let earnedInRound = 0;
-            const nodeShapley = isSlashed ? 0 : shapleyScores[node.id]?.shapleyValue || 0;
+            const nodeShapley = isSlashed || node.status === 'Slashed' ? 0 : shapleyScores[node.id]?.shapleyValue || 0;
+            let penalty = 0;
 
-            if (isSlashed) {
+            if (node.status === 'Slashed') {
+              status = 'Slashed';
+            } else if (isSlashed) {
               status = 'Slashed' as const;
-              const penalty = Math.round(currentStake * (activeCovenant.slashingPenaltyPercent / 100));
-              currentStake = Math.max(1000, currentStake - penalty);
+              const requestedPenalty = Math.round(currentStake * (roundCovenant.slashingPenaltyPercent / 100));
+              penalty = Number.isFinite(requestedPenalty)
+                ? Math.min(Math.max(0, currentStake), Math.max(0, requestedPenalty))
+                : 0;
+              currentStake -= penalty;
               currentSlashed += penalty;
-              totalSlashedCOV += penalty;
             } else if (isFlagged) {
               status = 'Flagged' as const;
               earnedInRound = Math.round(nodeShapley * 1500); // reduced reward
@@ -133,38 +173,44 @@ export default function App() {
             }
 
             return {
-              ...node,
-              status,
-              stakeAmount: currentStake,
-              slashedLosses: currentSlashed,
-              shapleyValue: nodeShapley,
-              accumulatedRewards: node.accumulatedRewards + earnedInRound,
-              lastStateHash: '0x' + Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join(''),
+              node: {
+                ...node,
+                status,
+                stakeAmount: currentStake,
+                slashedLosses: currentSlashed,
+                shapleyValue: nodeShapley,
+                accumulatedRewards: node.accumulatedRewards + earnedInRound,
+                lastStateHash: stateHashes.get(node.id) || node.lastStateHash,
+              },
+              earnedInRound,
+              penalty,
             };
-          });
+          };
+          const settlements = settlementNodes.map(settleNode);
+          const totalSlashedCOV = settlements.reduce((sum, result) => sum + result.penalty, 0);
+          const totalRewards = settlements.reduce((sum, result) => sum + result.earnedInRound, 0);
 
-          setNodes(finalNodes);
+          setNodes((prev) => mergeTelemetry(prev).map((node) => settleNode(node).node));
 
           // Update active covenant stats
-          const nextRoundNumber = activeCovenant.currentRound + 1;
+          const nextRoundNumber = roundCovenant.currentRound + 1;
           const lossDelta = -(0.003 + Math.random() * 0.004);
           const accDelta = +(0.002 + Math.random() * 0.003);
 
-          const newLoss = Math.max(0.04, activeCovenant.globalLoss + lossDelta);
-          const newAcc = Math.min(0.995, activeCovenant.globalAccuracy + accDelta);
+          const newLoss = Math.max(0.04, roundCovenant.globalLoss + lossDelta);
+          const newAcc = Math.min(0.995, roundCovenant.globalAccuracy + accDelta);
 
-          const updatedCovenants = covenants.map((c) =>
-            c.id === activeCovenant.id
+          setCovenants((prev) => prev.map((c) =>
+            c.id === roundCovenantId
               ? {
                   ...c,
-                  currentRound: nextRoundNumber,
-                  globalLoss: Number(newLoss.toFixed(4)),
-                  globalAccuracy: Number(newAcc.toFixed(4)),
-                  allocatedRewards: c.allocatedRewards + 3500,
+                  currentRound: c.currentRound + 1,
+                  globalLoss: Number(Math.max(0.04, c.globalLoss + lossDelta).toFixed(4)),
+                  globalAccuracy: Number(Math.min(0.995, c.globalAccuracy + accDelta).toFixed(4)),
+                  allocatedRewards: c.allocatedRewards + totalRewards,
                 }
               : c
-          );
-          setCovenants(updatedCovenants);
+          ));
 
           // Append round record
           const newRoundRecord: TrainingRound = {
@@ -177,35 +223,38 @@ export default function App() {
             activeNodesCount: defenseResult.acceptedNodes.length,
             byzantineDetectedCount: defenseResult.slashedNodes.length,
             slashedTotalCOV: totalSlashedCOV,
-            rewardDistributedCOV: 3500,
+            rewardDistributedCOV: totalRewards,
             merkleRoot: '0x' + Array.from({ length: 40 }, () => Math.floor(Math.random() * 16).toString(16)).join(''),
             auditPassed: true,
-            nodeSnapshots: finalNodes.map((fn) => ({
+            nodeSnapshots: settlements.map(({ node: fn, earnedInRound }) => ({
               nodeId: fn.id,
               shapleyShare: fn.shapleyValue,
-              rewardEarned: Math.round(fn.shapleyValue * 3500),
+              rewardEarned: earnedInRound,
               status: fn.status,
               cosineSim: fn.cosineSimilarity,
               gradientNorm: fn.gradientNorm,
             })),
           };
 
-          setRecentRounds([newRoundRecord, ...recentRounds.slice(0, 9)]);
+          setRecentRounds((prev) => [newRoundRecord, ...prev.slice(0, 9)]);
 
           setTimeout(() => {
             setSimulationPhase(0);
+            roundBusyRef.current = false;
             setIsSimulating(false);
           }, 800);
         }, 800);
       }, 800);
     }, 800);
   };
+  const executeRoundStepRef = useRef(executeRoundStep);
+  executeRoundStepRef.current = executeRoundStep;
 
   // Auto-loop execution
   useEffect(() => {
     if (isRunningAuto) {
       autoLoopTimerRef.current = setInterval(() => {
-        executeRoundStep();
+        executeRoundStepRef.current();
       }, 4000);
     } else {
       if (autoLoopTimerRef.current) {
@@ -218,7 +267,7 @@ export default function App() {
         clearInterval(autoLoopTimerRef.current);
       }
     };
-  }, [isRunningAuto, activeCovenant, nodes, isSimulating, attackConfig]);
+  }, [isRunningAuto]);
 
   const handleUpdateNodeStake = (nodeId: string, deltaStake: number) => {
     setNodes((prev) =>
@@ -233,13 +282,35 @@ export default function App() {
   };
 
   const handleCreateCovenant = (newCov: Covenant) => {
-    setCovenants([newCov, ...covenants]);
+    setCovenants((prev) => [newCov, ...prev]);
     setActiveCovenantId(newCov.id);
   };
 
   const handleRequestDispute = (node: FederatedNode) => {
     setSelectedNodeId(node.id);
     setActiveTab('arbiter');
+  };
+
+  const handleApplyRuling = (nodeId: string, ruling: DisputeRuling) => {
+    setNodes((prev) => prev.map((node) => {
+      if (node.id !== nodeId || node.status === 'Slashed') return node;
+      if (ruling.ruling === 'SLASH_AND_EJECT') {
+        const availableStake = Number.isFinite(node.stakeAmount) ? Math.max(0, node.stakeAmount) : 0;
+        const penalty = Number.isFinite(ruling.slashedAmount)
+          ? Math.min(availableStake, Math.max(0, ruling.slashedAmount))
+          : 0;
+        return {
+          ...node,
+          status: 'Slashed',
+          stakeAmount: availableStake - penalty,
+          slashedLosses: node.slashedLosses + penalty,
+          shapleyValue: 0,
+        };
+      }
+      if (ruling.ruling === 'QUARANTINE_FOR_VERIFICATION') return { ...node, status: 'Flagged' };
+      if (ruling.ruling === 'BENIGN_VARIATION_ACCEPT') return { ...node, status: 'Verified' };
+      return node;
+    }));
   };
 
   return (
@@ -293,6 +364,8 @@ export default function App() {
           <ArbiterAuditView
             covenant={activeCovenant}
             nodes={nodes}
+            initialNodeId={selectedNodeId ?? undefined}
+            onApplyRuling={handleApplyRuling}
           />
         )}
 

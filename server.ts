@@ -1,8 +1,10 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import type { GenerateContentResponse } from '@google/genai';
+import type { TokenUsage } from './src/types/covenant';
 
 dotenv.config();
 
@@ -12,6 +14,69 @@ app.use(express.json());
 
 // Initialize Google GenAI client if key exists
 const apiKey = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const sessionUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0 };
+
+function recordUsage(response: GenerateContentResponse): TokenUsage {
+  const metadata = response.usageMetadata;
+  const usage: TokenUsage = {
+    promptTokens: metadata?.promptTokenCount ?? 0,
+    outputTokens: metadata?.candidatesTokenCount ?? 0,
+    totalTokens: metadata?.totalTokenCount ?? 0,
+    model: GEMINI_MODEL,
+    ...(metadata?.thoughtsTokenCount !== undefined ? { thinkingTokens: metadata.thoughtsTokenCount } : {}),
+  };
+  sessionUsage.promptTokens += usage.promptTokens;
+  sessionUsage.outputTokens += usage.outputTokens;
+  sessionUsage.totalTokens += usage.totalTokens;
+  console.log('[Gemini usage]', usage);
+  return usage;
+}
+
+const requestWindows = new Map<string, { count: number; expires: number }>();
+function arbiterRateLimit(req: Request, res: Response, next: NextFunction) {
+  const now = Date.now();
+  for (const [ip, window] of requestWindows) {
+    if (window.expires <= now) requestWindows.delete(ip);
+  }
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const window = requestWindows.get(ip) || { count: 0, expires: now + 60_000 };
+  requestWindows.set(ip, window);
+  if (window.count >= 20) {
+    res.setHeader('Retry-After', Math.ceil((window.expires - now) / 1000));
+    res.status(429).json({ error: 'Arbiter rate limit exceeded. Try again shortly.' });
+    return;
+  }
+  window.count++;
+  next();
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const finiteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const promptString = (value: string) => value.slice(0, 500).replace(/[\r\n\u2028\u2029]/g, ' ');
+
+function validCovenant(value: unknown): value is Record<string, any> {
+  if (!isObject(value)) return false;
+  return ['name', 'domain', 'targetModel', 'aggregationAlgorithm', 'valuationMetric'].every(key => typeof value[key] === 'string') &&
+    ['rewardPool', 'epsilonDP', 'minStake', 'slashingPenaltyPercent'].every(key => finiteNumber(value[key]) && value[key] >= 0) &&
+    (value.slashingPenaltyPercent as number) <= 100 &&
+    ['FedAvg', 'FedProx', 'Multi-Krum', 'Trimmed-Mean', 'Coordinate-wise Median'].includes(value.aggregationAlgorithm as string) &&
+    ['Data-Shapley', 'Monte-Carlo Shapley', 'Influence Function', 'Dataset-Volume Proportional', 'Equal-Split'].includes(value.valuationMetric as string);
+}
+
+function validNode(value: unknown): value is Record<string, any> {
+  return isObject(value) &&
+    ['id', 'name', 'institution', 'status'].every(key => typeof value[key] === 'string') &&
+    ['cosineSimilarity', 'gradientNorm', 'marginalLossReduction', 'stakeAmount'].every(key => finiteNumber(value[key])) &&
+    (value.stakeAmount as number) >= 0 && (value.gradientNorm as number) >= 0 &&
+    Math.abs(value.cosineSimilarity as number) <= 1 &&
+    ['Ready', 'Training', 'Submitting', 'Verified', 'Flagged', 'Slashed'].includes(value.status as string);
+}
+
+function sanitizePromptFields(value: Record<string, any>) {
+  return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, typeof field === 'string' ? promptString(field) : field]));
+}
 let genAI: GoogleGenAI | null = null;
 if (apiKey) {
   try {
@@ -31,13 +96,19 @@ app.get('/api/health', (_req: Request, res: Response) => {
 });
 
 // Covenant Protocol Audit Endpoint
-app.post('/api/arbiter/audit', async (req: Request, res: Response) => {
-  const { covenant, attackScenario } = req.body;
+app.get('/api/arbiter/usage', (_req: Request, res: Response) => {
+  res.json({ ...sessionUsage, model: GEMINI_MODEL });
+});
 
-  if (!covenant) {
-    res.status(400).json({ error: 'Covenant parameters are required' });
+app.post('/api/arbiter/audit', arbiterRateLimit, async (req: Request, res: Response) => {
+  const { covenant: inputCovenant, attackScenario } = req.body || {};
+
+  if (!validCovenant(inputCovenant) || (attackScenario !== undefined && typeof attackScenario !== 'string')) {
+    res.status(400).json({ error: 'Valid covenant parameters and attack scenario are required' });
     return;
   }
+  const covenant = sanitizePromptFields(inputCovenant);
+  let fallbackReason = 'GEMINI_API_KEY is not configured';
 
   const systemPrompt = `You are the chief cryptographic auditor and game-theoretic arbiter of the Federated AI Rewards Covenant protocol.
 Evaluate the given federated covenant configuration for:
@@ -66,13 +137,14 @@ Valuation Metric: ${covenant.valuationMetric}
 Differential Privacy Epsilon: ${covenant.epsilonDP}
 Min Stake: ${covenant.minStake} COV
 Slashing Penalty: ${covenant.slashingPenaltyPercent}%
-Simulated Attack Vector: ${attackScenario || 'Standard distributed consortium'}
+Simulated Attack Vector: ${promptString(attackScenario || 'Standard distributed consortium')}
 `;
 
   if (genAI) {
     try {
+      sessionUsage.calls++;
       const response = await genAI.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: [
           { role: 'user', parts: [{ text: `${systemPrompt}\n\n${userPrompt}\nOutput strictly valid JSON without code fences.` }] },
         ],
@@ -82,21 +154,21 @@ Simulated Attack Vector: ${attackScenario || 'Standard distributed consortium'}
         },
       });
 
-      const responseText = response.text || '{}';
-      try {
-        const parsed = JSON.parse(responseText);
-        res.json({ success: true, source: 'gemini', audit: parsed });
-        return;
-      } catch {
-        // Fall through to fallback parser
+      const usage = recordUsage(response);
+      const parsed = JSON.parse(response.text || '{}');
+      if (!isObject(parsed) || !['APPROVED', 'CONDITIONAL_APPROVAL', 'REVISE_REQUIRED'].includes(parsed.verdict as string)) {
+        throw new Error('Invalid Gemini audit response');
       }
+      res.json({ success: true, source: 'gemini', audit: parsed, usage });
+      return;
     } catch (error) {
+      fallbackReason = 'Gemini call failed or returned an invalid audit';
       console.warn('Gemini API call failed, using heuristic arbiter engine:', error);
     }
   }
 
   // Deterministic Game-Theoretic Fallback Arbiter
-  const isKrumOrMedian = ['Multi-Krum', 'Coordinate-wise Median', 'Trimmed Mean'].includes(covenant.aggregationAlgorithm);
+  const isKrumOrMedian = ['Multi-Krum', 'Coordinate-wise Median', 'Trimmed-Mean'].includes(covenant.aggregationAlgorithm);
   const isShapley = covenant.valuationMetric.includes('Shapley');
   const isHighEpsilon = covenant.epsilonDP > 4.0;
   const isLowStake = covenant.minStake < 5000;
@@ -127,6 +199,8 @@ Simulated Attack Vector: ${attackScenario || 'Standard distributed consortium'}
   res.json({
     success: true,
     source: 'covenant_heuristic_engine',
+    usage: null,
+    fallbackReason,
     audit: {
       verdict,
       gameTheoreticScore: score,
@@ -147,20 +221,22 @@ Simulated Attack Vector: ${attackScenario || 'Standard distributed consortium'}
 });
 
 // Dispute Arbiter Endpoint
-app.post('/api/arbiter/resolve-dispute', async (req: Request, res: Response) => {
-  const { node, roundData, covenant } = req.body;
+app.post('/api/arbiter/resolve-dispute', arbiterRateLimit, async (req: Request, res: Response) => {
+  const { node: inputNode, covenant: inputCovenant } = req.body || {};
 
-  if (!node) {
-    res.status(400).json({ error: 'Node telemetry required' });
+  if (!validNode(inputNode) || !validCovenant(inputCovenant)) {
+    res.status(400).json({ error: 'Valid node telemetry and covenant parameters are required' });
     return;
   }
-
-  const isAnomalous = node.cosineSimilarity < 0.2 || node.gradientNorm > 8.0 || node.status === 'Flagged' || node.status === 'Slashed';
+  const node = sanitizePromptFields(inputNode);
+  const covenant = sanitizePromptFields(inputCovenant);
+  let fallbackReason = 'GEMINI_API_KEY is not configured';
 
   if (genAI) {
     try {
+      sessionUsage.calls++;
       const response = await genAI.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: [
           {
             role: 'user',
@@ -173,7 +249,7 @@ Cosine Similarity to Global Direction: ${node.cosineSimilarity}
 Gradient Norm: ${node.gradientNorm} (Nominal range: 0.5 - 2.5)
 Marginal Loss Drop: ${node.marginalLossReduction}
 Current Stake: ${node.stakeAmount} COV
-Covenant Slashing Rate: ${covenant?.slashingPenaltyPercent || 35}%
+Covenant Slashing Rate: ${covenant.slashingPenaltyPercent}%
 
 Determine if this is Byzantine poisoning, free-riding, or benign non-IID data skew.
 Return strictly JSON with:
@@ -193,10 +269,16 @@ Return strictly JSON with:
         },
       });
 
+      const usage = recordUsage(response);
       const parsed = JSON.parse(response.text || '{}');
-      res.json({ success: true, source: 'gemini', ruling: parsed });
+      if (!isObject(parsed) || !['SLASH_AND_EJECT', 'BENIGN_VARIATION_ACCEPT', 'QUARANTINE_FOR_VERIFICATION'].includes(parsed.ruling as string) ||
+          !finiteNumber(parsed.slashedAmount) || parsed.slashedAmount < 0 || parsed.slashedAmount > node.stakeAmount) {
+        throw new Error('Invalid Gemini ruling response');
+      }
+      res.json({ success: true, source: 'gemini', ruling: parsed, usage });
       return;
     } catch (err) {
+      fallbackReason = 'Gemini call failed or returned an invalid ruling';
       console.warn('Gemini dispute arbitration failed, using rule engine:', err);
     }
   }
@@ -208,7 +290,7 @@ Return strictly JSON with:
 
   if (node.cosineSimilarity < -0.3 || node.gradientNorm > 10.0) {
     ruling = 'SLASH_AND_EJECT';
-    slashedAmount = Math.round(node.stakeAmount * ((covenant?.slashingPenaltyPercent || 35) / 100));
+    slashedAmount = Math.min(node.stakeAmount, Math.round(node.stakeAmount * (covenant.slashingPenaltyPercent / 100)));
     justification = `Severe gradient inversion and abnormal norm (${node.gradientNorm}) indicates coordinated Byzantine backdoor poisoning. Article III enforced.`;
   } else if (node.cosineSimilarity < 0.2 || node.marginalLossReduction <= 0) {
     ruling = 'QUARANTINE_FOR_VERIFICATION';
@@ -221,6 +303,8 @@ Return strictly JSON with:
   res.json({
     success: true,
     source: 'deterministic_arbiter',
+    usage: null,
+    fallbackReason,
     ruling: {
       ruling,
       justification,

@@ -52,7 +52,11 @@ export function computeMonteCarloShapley(
 
   for (let m = 0; m < numPermutations; m++) {
     // Generate random permutation of indices
-    const perm = [...nodes].sort(() => Math.random() - 0.5);
+    const perm = [...nodes];
+    for (let i = perm.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [perm[i], perm[j]] = [perm[j], perm[i]];
+    }
     const coalition: FederatedNode[] = [];
     let prevUtility = 0;
 
