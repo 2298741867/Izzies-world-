@@ -112,6 +112,23 @@ export interface ByzantineAttackConfig {
   intensity: number; // 0.0 to 1.0
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  thinkingTokens?: number;
+  model: string;
+}
+
+export interface ArbiterResponse {
+  success: boolean;
+  usage?: TokenUsage | null;
+  source?: 'gemini' | 'covenant_heuristic_engine' | 'deterministic_arbiter';
+  fallbackReason?: string;
+  audit?: ArbiterAuditReport;
+  ruling?: DisputeRuling;
+}
+
 export interface ArbiterAuditReport {
   verdict: 'APPROVED' | 'CONDITIONAL_APPROVAL' | 'REVISE_REQUIRED';
   gameTheoreticScore: number;

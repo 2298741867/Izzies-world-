@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { FederatedNode, Covenant } from '../types/covenant';
 import { computeMonteCarloShapley, compareRewardAllocationModels } from '../utils/shapley';
 import { Calculator, Play, Info, AlertTriangle, CheckCircle, ShieldAlert, Sparkles } from 'lucide-react';
@@ -17,7 +17,7 @@ export const ShapleyEngineView: React.FC<ShapleyEngineViewProps> = ({ nodes, cov
 
   const [activeAxiomTab, setActiveAxiomTab] = useState<'dummy' | 'efficiency' | 'symmetry' | 'additivity'>('dummy');
 
-  const comparisonData = compareRewardAllocationModels(nodes);
+  const comparisonData = useMemo(() => compareRewardAllocationModels(nodes), [nodes]);
 
   const handleRunMonteCarlo = () => {
     setIsCalculating(true);

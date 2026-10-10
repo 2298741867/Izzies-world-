@@ -1,24 +1,86 @@
-import React, { useState } from 'react';
-import { Covenant, FederatedNode, ArbiterAuditReport, DisputeRuling } from '../types/covenant';
+import React, { useState, useEffect } from 'react';
+import { Covenant, FederatedNode, ArbiterAuditReport, DisputeRuling, TokenUsage, ArbiterResponse } from '../types/covenant';
 import { ShieldCheck, Sparkles, Scale, AlertOctagon, CheckCircle2, AlertTriangle, FileCode, Cpu } from 'lucide-react';
 
 interface ArbiterAuditViewProps {
   covenant: Covenant;
   nodes: FederatedNode[];
-  onApplyAmendment?: (amendment: string) => void;
+  initialNodeId?: string;
+  onApplyRuling?: (nodeId: string, ruling: DisputeRuling) => void;
 }
 
-export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, nodes, onApplyAmendment }) => {
+const safeString = (value: unknown) => typeof value === 'string' ? value : '';
+const safeNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
+const safeStrings = (value: unknown): string[] => Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
+const parseUsage = (value: TokenUsage | null | undefined): TokenUsage | null =>
+  value && typeof value.model === 'string' &&
+  [value.promptTokens, value.outputTokens, value.totalTokens].every(count => typeof count === 'number' && Number.isFinite(count) && count >= 0)
+    ? {
+        promptTokens: value.promptTokens,
+        outputTokens: value.outputTokens,
+        totalTokens: value.totalTokens,
+        model: value.model,
+        ...(typeof value.thinkingTokens === 'number' && Number.isFinite(value.thinkingTokens) && value.thinkingTokens >= 0
+          ? { thinkingTokens: value.thinkingTokens } : {}),
+      }
+    : null;
+const usageLine = (usage: TokenUsage | null, source: ArbiterResponse['source'], fallbackReason: string) =>
+  usage && source === 'gemini'
+    ? `Tokens: ${usage.promptTokens} in · ${usage.outputTokens} out · ${usage.totalTokens} total (${usage.model})`
+    : fallbackReason.startsWith('Gemini call failed')
+      ? 'Heuristic engine – model usage unavailable (Gemini attempt failed)'
+      : source === 'gemini'
+        ? 'Model token usage unavailable'
+        : 'No model call (heuristic engine) – 0 tokens';
+
+export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, nodes, initialNodeId, onApplyRuling }) => {
   const [isAuditing, setIsAuditing] = useState<boolean>(false);
   const [auditReport, setAuditReport] = useState<ArbiterAuditReport | null>(null);
-  const [selectedDisputeNodeId, setSelectedDisputeNodeId] = useState<string>(nodes[nodes.length - 1]?.id || '');
+  const [selectedDisputeNodeId, setSelectedDisputeNodeId] = useState<string>(initialNodeId || nodes[nodes.length - 1]?.id || '');
   const [isResolvingDispute, setIsResolvingDispute] = useState<boolean>(false);
   const [disputeRuling, setDisputeRuling] = useState<DisputeRuling | null>(null);
-  const [activeTab, setActiveTab] = useState<'audit' | 'tribunal' | 'gametheory'>('audit');
+  const [activeTab, setActiveTab] = useState<'audit' | 'tribunal' | 'gametheory'>(initialNodeId ? 'tribunal' : 'audit');
+  const [auditUsage, setAuditUsage] = useState<TokenUsage | null>(null);
+  const [auditSource, setAuditSource] = useState<ArbiterResponse['source']>();
+  const [rulingUsage, setRulingUsage] = useState<TokenUsage | null>(null);
+  const [rulingSource, setRulingSource] = useState<ArbiterResponse['source']>();
+  const [auditFallbackReason, setAuditFallbackReason] = useState('');
+  const [rulingFallbackReason, setRulingFallbackReason] = useState('');
+  const [error, setError] = useState('');
+  const [sessionUsage, setSessionUsage] = useState<(TokenUsage & { calls: number }) | null>(null);
+  const [rulingNodeId, setRulingNodeId] = useState('');
+  const [rulingStateHash, setRulingStateHash] = useState('');
+  const [rulingApplied, setRulingApplied] = useState(false);
+
+  const refreshUsage = async () => {
+    try {
+      const res = await fetch('/api/arbiter/usage');
+      if (!res.ok) throw new Error(`Usage request failed (${res.status})`);
+      const data = await res.json();
+      const usage = parseUsage(data);
+      if (!usage || typeof data.calls !== 'number' || !Number.isFinite(data.calls) || data.calls < 0) {
+        throw new Error('Invalid token totals response');
+      }
+      setSessionUsage({ ...usage, calls: data.calls });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to fetch token totals');
+    }
+  };
+
+  useEffect(() => { void refreshUsage(); }, []);
+  useEffect(() => {
+    if (initialNodeId) {
+      setSelectedDisputeNodeId(initialNodeId);
+      setActiveTab('tribunal');
+      setDisputeRuling(null);
+    }
+  }, [initialNodeId]);
 
   // Trigger Covenant Audit
   const handleRunAudit = async () => {
     setIsAuditing(true);
+    setError('');
+    setAuditReport(null);
     try {
       const res = await fetch('/api/arbiter/audit', {
         method: 'POST',
@@ -28,14 +90,31 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
           attackScenario: 'Distributed consortium with suspected non-IID skew and Sybil adversaries',
         }),
       });
-      const data = await res.json();
-      if (data.success && data.audit) {
-        setAuditReport(data.audit);
+      if (!res.ok) throw new Error(`Audit request failed (${res.status})`);
+      const data: ArbiterResponse = await res.json();
+      const audit = data.audit;
+      if (!data.success || !audit || !['APPROVED', 'CONDITIONAL_APPROVAL', 'REVISE_REQUIRED'].includes(audit.verdict)) {
+        throw new Error('Invalid audit response');
       }
+      setAuditReport({
+        verdict: audit.verdict,
+        gameTheoreticScore: safeNumber(audit.gameTheoreticScore),
+        incentiveCompatibilitySummary: safeString(audit.incentiveCompatibilitySummary),
+        byzantineResistance: safeString(audit.byzantineResistance),
+        privacyAssessment: safeString(audit.privacyAssessment),
+        vulnerabilitiesDetected: safeStrings(audit.vulnerabilitiesDetected),
+        recommendations: safeStrings(audit.recommendations),
+        formalClauseAmendment: safeString(audit.formalClauseAmendment),
+      });
+      setAuditUsage(parseUsage(data.usage));
+      setAuditSource(data.source);
+      setAuditFallbackReason(safeString(data.fallbackReason));
     } catch (err) {
       console.error('Audit failed:', err);
+      setError(err instanceof Error ? err.message : 'Audit failed');
     } finally {
       setIsAuditing(false);
+      void refreshUsage();
     }
   };
 
@@ -45,6 +124,11 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
     if (!node) return;
 
     setIsResolvingDispute(true);
+    setError('');
+    setDisputeRuling(null);
+    setRulingApplied(false);
+    setRulingNodeId(node.id);
+    setRulingStateHash(node.lastStateHash);
     try {
       const res = await fetch('/api/arbiter/resolve-dispute', {
         method: 'POST',
@@ -54,21 +138,43 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
           covenant,
         }),
       });
-      const data = await res.json();
-      if (data.success && data.ruling) {
-        setDisputeRuling(data.ruling);
+      if (!res.ok) throw new Error(`Dispute request failed (${res.status})`);
+      const data: ArbiterResponse = await res.json();
+      const ruling = data.ruling;
+      if (!data.success || !ruling || !['SLASH_AND_EJECT', 'BENIGN_VARIATION_ACCEPT', 'QUARANTINE_FOR_VERIFICATION'].includes(ruling.ruling) ||
+          typeof ruling.slashedAmount !== 'number' || !Number.isFinite(ruling.slashedAmount) || ruling.slashedAmount < 0) {
+        throw new Error('Invalid ruling response');
       }
+      setDisputeRuling({
+        ruling: ruling.ruling,
+        justification: safeString(ruling.justification),
+        slashedAmount: ruling.slashedAmount,
+        confidence: Math.max(0, Math.min(1, safeNumber(ruling.confidence))),
+        proofHash: safeString(ruling.proofHash),
+      });
+      setRulingUsage(parseUsage(data.usage));
+      setRulingSource(data.source);
+      setRulingFallbackReason(safeString(data.fallbackReason));
     } catch (err) {
       console.error('Dispute resolution failed:', err);
+      setError(err instanceof Error ? err.message : 'Dispute resolution failed');
     } finally {
       setIsResolvingDispute(false);
+      void refreshUsage();
     }
   };
 
   const selectedNode = nodes.find((n) => n.id === selectedDisputeNodeId) || nodes[0];
+  const rulingIsStale = nodes.find(node => node.id === rulingNodeId)?.lastStateHash !== rulingStateHash;
 
   return (
     <div className="space-y-6">
+      {error && <div role="alert" className="text-sm text-rose-400">{error}</div>}
+      {sessionUsage && (
+        <div className="text-[11px] font-mono text-slate-400">
+          Server session: {sessionUsage.promptTokens} in · {sessionUsage.outputTokens} out · {sessionUsage.totalTokens} total · {sessionUsage.calls} Gemini calls
+        </div>
+      )}
       {/* Header */}
       <div className="p-6 bg-slate-900/80 border border-slate-800 rounded-lg space-y-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -172,6 +278,11 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
                     </span>
                   </div>
                 </div>
+              </div>
+
+              <div className="text-[11px] font-mono text-slate-400">
+                {usageLine(auditUsage, auditSource, auditFallbackReason)}
+                {auditFallbackReason && <div>Fallback: {auditFallbackReason}</div>}
               </div>
 
               {/* Assessment Breakdown Cards */}
@@ -283,6 +394,7 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
                 <label className="block text-xs text-slate-400 mb-1">Select Disputed Node:</label>
                 <select
                   value={selectedDisputeNodeId}
+                  disabled={isResolvingDispute}
                   onChange={(e) => {
                     setSelectedDisputeNodeId(e.target.value);
                     setDisputeRuling(null);
@@ -379,6 +491,24 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
               <p className="text-xs text-slate-200 leading-relaxed font-sans">
                 {disputeRuling.justification}
               </p>
+              <div className="text-[11px] font-mono text-slate-400">
+                {usageLine(rulingUsage, rulingSource, rulingFallbackReason)}
+                {rulingFallbackReason && <div>Fallback: {rulingFallbackReason}</div>}
+              </div>
+              {onApplyRuling && (
+                <button
+                  disabled={rulingApplied || rulingIsStale || rulingNodeId !== selectedDisputeNodeId}
+                  onClick={() => {
+                    if (rulingIsStale || rulingApplied || rulingNodeId !== selectedDisputeNodeId) return;
+                    onApplyRuling(rulingNodeId, disputeRuling);
+                    setRulingApplied(true);
+                  }}
+                  className="px-3 py-2 text-xs bg-slate-800 rounded disabled:opacity-50"
+                >
+                  {rulingApplied ? 'Ruling applied' : 'Apply ruling to node'}
+                </button>
+              )}
+              {rulingIsStale && <p className="text-xs text-amber-400">Node submission changed. Request a new ruling before applying.</p>}
 
               <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono text-slate-400">
                 <span>Proof Hash: <strong className="text-slate-300">{disputeRuling.proofHash}</strong></span>
