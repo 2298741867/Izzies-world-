@@ -45,6 +45,7 @@ export default function App() {
     roundBusyRef.current = true;
     setIsSimulating(true);
     const roundCovenantId = activeCovenant.id;
+    const initialStatuses = new Map(nodesRef.current.map((node) => [node.id, node.status]));
 
     // Phase 1: Broadcast
     setSimulationPhase(1);
@@ -145,7 +146,8 @@ export default function App() {
           ]));
           const settleNode = (node: FederatedNode) => {
             const isSlashed = slashedIds.has(node.id);
-            const isFlagged = flaggedIds.has(node.id) || node.status === 'Flagged';
+            const newlyQuarantined = node.status === 'Flagged' && initialStatuses.get(node.id) !== 'Flagged';
+            const isFlagged = flaggedIds.has(node.id) || newlyQuarantined;
 
             let status = node.status;
             let currentStake = node.stakeAmount;

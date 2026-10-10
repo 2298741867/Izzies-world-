@@ -49,6 +49,7 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
   const [error, setError] = useState('');
   const [sessionUsage, setSessionUsage] = useState<(TokenUsage & { calls: number }) | null>(null);
   const [rulingNodeId, setRulingNodeId] = useState('');
+  const [rulingStateHash, setRulingStateHash] = useState('');
   const [rulingApplied, setRulingApplied] = useState(false);
 
   const refreshUsage = async () => {
@@ -127,6 +128,7 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
     setDisputeRuling(null);
     setRulingApplied(false);
     setRulingNodeId(node.id);
+    setRulingStateHash(node.lastStateHash);
     try {
       const res = await fetch('/api/arbiter/resolve-dispute', {
         method: 'POST',
@@ -163,6 +165,7 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
   };
 
   const selectedNode = nodes.find((n) => n.id === selectedDisputeNodeId) || nodes[0];
+  const rulingIsStale = nodes.find(node => node.id === rulingNodeId)?.lastStateHash !== rulingStateHash;
 
   return (
     <div className="space-y-6">
@@ -494,8 +497,9 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
               </div>
               {onApplyRuling && (
                 <button
-                  disabled={rulingApplied || rulingNodeId !== selectedDisputeNodeId}
+                  disabled={rulingApplied || rulingIsStale || rulingNodeId !== selectedDisputeNodeId}
                   onClick={() => {
+                    if (rulingIsStale || rulingApplied || rulingNodeId !== selectedDisputeNodeId) return;
                     onApplyRuling(rulingNodeId, disputeRuling);
                     setRulingApplied(true);
                   }}
@@ -504,6 +508,7 @@ export const ArbiterAuditView: React.FC<ArbiterAuditViewProps> = ({ covenant, no
                   {rulingApplied ? 'Ruling applied' : 'Apply ruling to node'}
                 </button>
               )}
+              {rulingIsStale && <p className="text-xs text-amber-400">Node submission changed. Request a new ruling before applying.</p>}
 
               <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono text-slate-400">
                 <span>Proof Hash: <strong className="text-slate-300">{disputeRuling.proofHash}</strong></span>
